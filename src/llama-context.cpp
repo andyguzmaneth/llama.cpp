@@ -3114,9 +3114,25 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    static const bool copy_stats = getenv("LLAMA_COPY_STATS") != nullptr;
+    const int64_t t_graph_start = copy_stats ? ggml_time_us() : 0;
+    if (copy_stats) {
+        copy_experts.bytes   = 0;
+        copy_experts.us      = 0;
+        copy_experts.n_calls = 0;
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    if (copy_stats && copy_experts.n_calls > 0) {
+        ggml_backend_sched_synchronize(sched.get());
+        const int64_t t_graph = ggml_time_us() - t_graph_start;
+        LLAMA_LOG_INFO("%s: copy stats: %d uploads, %.1f MiB, %.1f ms in copy callback, %.1f ms graph, %.2f GB/s in callback\n",
+            __func__, copy_experts.n_calls, copy_experts.bytes/1048576.0, copy_experts.us/1000.0, t_graph/1000.0,
+            copy_experts.us > 0 ? copy_experts.bytes/(copy_experts.us*1000.0) : 0.0);
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
@@ -3134,6 +3150,12 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     auto & st = lctx->copy_experts;
 
+    // diagnostic: upload whole expert tensors
+    static const bool full_copy = getenv("LLAMA_FULL_EXPERT_COPY") != nullptr;
+    if (full_copy) {
+        return false;
+    }
+
     // the ids must be computed before the split starts, so only the first node of the split is considered
     if (ggml_graph_n_nodes(graph) == 0) {
         return false;
@@ -3150,6 +3172,13 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
+
+    static const bool copy_stats = getenv("LLAMA_COPY_STATS") != nullptr;
+    const int64_t t_start = copy_stats ? ggml_time_us() : 0;
+    struct stats_guard {
+        copy_experts_info & st; int64_t t0; bool on;
+        ~stats_guard() { if (on) { st.us += ggml_time_us() - t0; st.n_calls++; } }
+    } guard { st, t_start, copy_stats };
 
     if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
@@ -3189,6 +3218,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             }
             if (next < e) {
                 ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                st.bytes += (e - next)*expert_size;
             }
             e   += n;
             next = e;
@@ -3200,6 +3230,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
             ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            st.bytes += size;
         }
 
         first = last + 1;

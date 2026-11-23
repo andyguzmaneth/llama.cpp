@@ -3193,11 +3193,88 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// Large uploads from pageable host memory (e.g. op offload of host experts loaded without pinned buffers) go through a
+// ring of pinned staging chunks: the CPU copy of one chunk overlaps the DMA of the previous ones.
+// Opt-in with GGML_CUDA_UPLOAD_STAGING=1 (measured slower than the driver's pageable path on a single-channel DDR5 laptop),
+// GGML_CUDA_UPLOAD_CHUNK_MIB sets the chunk size.
+struct ggml_cuda_upload_staging {
+    static constexpr int n_slots = 4;
+    std::mutex   mutex;
+    bool         tried   = false;
+    bool         ok      = false;
+    size_t       chunk   = 0;
+    void       * buf[n_slots] = {};
+    cudaEvent_t  ev [n_slots] = {};
+    int          next    = 0;
+};
+
+static bool ggml_cuda_upload_staged(int device, cudaStream_t stream, char * dst, const char * src, size_t size) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_UPLOAD_STAGING");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (!enabled || size < (size_t) 4*1024*1024 || device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, src) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (attr.type != cudaMemoryTypeUnregistered) {
+        return false; // pinned or device memory, the plain copy is already fast
+    }
+
+    static ggml_cuda_upload_staging staging[GGML_CUDA_MAX_DEVICES];
+    ggml_cuda_upload_staging & st = staging[device];
+    std::lock_guard<std::mutex> lock(st.mutex);
+
+    if (!st.tried) {
+        st.tried = true;
+        const char * env = getenv("GGML_CUDA_UPLOAD_CHUNK_MIB");
+        st.chunk = (size_t) (env ? std::max(1, atoi(env)) : 16) * 1024 * 1024;
+        st.ok = true;
+        for (int i = 0; i < ggml_cuda_upload_staging::n_slots && st.ok; i++) {
+            st.ok = cudaMallocHost(&st.buf[i], st.chunk) == cudaSuccess &&
+                    cudaEventCreateWithFlags(&st.ev[i], cudaEventDisableTiming) == cudaSuccess;
+        }
+        if (!st.ok) {
+            (void) cudaGetLastError();
+            GGML_LOG_WARN("%s: could not allocate pinned upload staging, using pageable copies\n", __func__);
+        }
+    }
+    if (!st.ok) {
+        return false;
+    }
+
+    while (size > 0) {
+        const int slot = st.next;
+        st.next = (st.next + 1) % ggml_cuda_upload_staging::n_slots;
+        const size_t n = std::min(size, st.chunk);
+
+        // the slot is free once its previous DMA has finished
+        CUDA_CHECK(cudaEventSynchronize(st.ev[slot]));
+        memcpy(st.buf[slot], src, n);
+        CUDA_CHECK(cudaMemcpyAsync(dst, st.buf[slot], n, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaEventRecord(st.ev[slot], stream));
+
+        src  += n;
+        dst  += n;
+        size -= n;
+    }
+    return true;
+}
+
 static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+
+    if (ggml_cuda_upload_staged(cuda_ctx->device, cuda_ctx->stream(), (char *) tensor->data + offset, (const char *) data, size)) {
+        return;
+    }
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }

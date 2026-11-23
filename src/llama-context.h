@@ -417,6 +417,11 @@ private:
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
 
+        // diagnostics (LLAMA_COPY_STATS)
+        size_t  bytes   = 0;
+        int64_t us      = 0;
+        int     n_calls = 0;
+
         void reset() {
             ids = nullptr;
             ids_data.clear();

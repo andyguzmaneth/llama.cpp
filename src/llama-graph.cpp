@@ -1902,6 +1902,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         ggml_prec_set_acc(res, GGML_PREC_BF16);
     }
 
+    // gravy-zeppelin 04, hand-ported: host-resident experts are computed on the CPU with 8-bit activations; when a large batch
+    // offloads them to the GPU, keep 8-bit activations instead of the Blackwell W4A4 default, which some layers do not tolerate
+    if ((w->type == GGML_TYPE_NVFP4 || w->type == GGML_TYPE_MXFP4) && w->buffer && ggml_backend_buffer_is_host(w->buffer) &&
+            ggml_prec_get_src(res, 1) == GGML_PREC_UNDEFINED) {
+        ggml_prec_set_src(res, GGML_PREC_Q8, 1);
+    }
+
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];
